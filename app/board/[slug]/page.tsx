@@ -1,10 +1,11 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { use } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { PanelLeftOpen } from "lucide-react";
+import { PanelLeftOpen, Wifi, WifiOff, Loader2 } from "lucide-react";
 import { useBoardStore } from "@/store/useBoardStore";
+import { useBoard } from "@/hooks/useBoard";
 import { TopBar } from "@/components/toolbar/TopBar";
 import { ToolSidebar } from "@/components/toolbar/ToolSidebar";
 import { Canvas } from "@/components/canvas/Canvas";
@@ -23,7 +24,7 @@ interface BoardPageProps {
 export default function BoardPage({ params }: BoardPageProps) {
   const { slug } = use(params);
 
-  // UI-only state (no need to live in Zustand)
+  // UI-only state
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showPresencePanel, setShowPresencePanel] = useState(false);
 
@@ -35,23 +36,81 @@ export default function BoardPage({ params }: BoardPageProps) {
     showExport,
     setShowExport,
     tool,
-    updateRemoteCursor,
   } = useBoardStore();
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      // Simulate random cursor movement for demo
-      ["c1", "c2", "c3"].forEach((id) => {
-        updateRemoteCursor(
-          id,
-          Math.random() * 800 + 100,
-          Math.random() * 500 + 100,
-        );
-      });
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [updateRemoteCursor]);
+  // ── Supabase integration ───────────────────────────────────────────────────
+  const { status, error, localUser, syncElement, removeElement } = useBoard(slug);
 
+  // ── Forward sync calls from store mutations ────────────────────────────────
+  // Diff previous vs current to only sync elements that actually changed.
+  const prevElementsRef = useRef<Map<string, string>>(new Map()); // id → JSON snapshot
+
+  useEffect(() => {
+    if (status !== "ready") return;
+
+    const current = elements.filter((el) => !el._preview);
+    const currentIds = new Set(current.map((el) => el.id));
+    const prev = prevElementsRef.current;
+
+    // Detect deleted elements
+    for (const prevId of prev.keys()) {
+      if (!currentIds.has(prevId)) {
+        removeElement(prevId);
+        prev.delete(prevId);
+      }
+    }
+
+    // Detect added or changed elements
+    for (const el of current) {
+      const snapshot = JSON.stringify(el);
+      if (prev.get(el.id) !== snapshot) {
+        syncElement(el);
+        prev.set(el.id, snapshot);
+      }
+    }
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [elements, status]);
+
+
+  // ── Loading / Error screen ─────────────────────────────────────────────────
+  if (status === "loading" || status === "idle") {
+    return (
+      <div className="h-screen w-screen bg-gray-50 flex flex-col items-center justify-center gap-4">
+        <div className="w-12 h-12 bg-linear-to-br from-violet-500 to-purple-600 rounded-2xl flex items-center justify-center animate-pulse">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
+            <path d="M12 2L2 7l10 5 10-5-10-5z" />
+            <path d="M2 17l10 5 10-5" />
+            <path d="M2 12l10 5 10-5" />
+          </svg>
+        </div>
+        <div className="flex items-center gap-2 text-gray-500 text-sm">
+          <Loader2 size={14} className="animate-spin" />
+          Connecting to board…
+        </div>
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="h-screen w-screen bg-gray-50 flex flex-col items-center justify-center gap-4">
+        <WifiOff size={32} className="text-red-400" />
+        <div className="text-center">
+          <p className="text-gray-800 font-semibold">Failed to connect</p>
+          <p className="text-gray-500 text-sm mt-1">{error}</p>
+        </div>
+        <button
+          onClick={() => window.location.reload()}
+          className="px-4 py-2 bg-violet-600 text-white rounded-lg text-sm hover:bg-violet-700 transition-colors"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  // ── Main board UI ──────────────────────────────────────────────────────────
   return (
     <div
       className="h-screen w-screen bg-gray-50 flex flex-col overflow-hidden select-none"
@@ -103,10 +162,13 @@ export default function BoardPage({ params }: BoardPageProps) {
           {/* Zoom Controls */}
           <ZoomControls />
 
-          {/* Element Counter */}
-          <div className="absolute bottom-4 right-4 bg-white/80 backdrop-blur rounded-lg px-3 py-1.5 text-[11px] text-gray-500 z-20 border border-gray-200/50">
-            {elements.filter((el) => !el._preview).length} element
-            {elements.filter((el) => !el._preview).length !== 1 ? "s" : ""}
+          {/* Element Counter + connection status */}
+          <div className="absolute bottom-4 right-4 flex items-center gap-2">
+            <div className="bg-white/80 backdrop-blur rounded-lg px-3 py-1.5 text-[11px] text-gray-500 z-20 border border-gray-200/50 flex items-center gap-1.5">
+              <Wifi size={10} className="text-green-500" />
+              {elements.filter((el) => !el._preview).length} element
+              {elements.filter((el) => !el._preview).length !== 1 ? "s" : ""}
+            </div>
           </div>
         </div>
 
@@ -122,6 +184,28 @@ export default function BoardPage({ params }: BoardPageProps) {
               <h3 className="text-sm font-bold text-gray-800 mb-3">
                 Active Users
               </h3>
+
+              {/* Local user (always shown) */}
+              <div className="flex items-center gap-2 mb-2">
+                <div
+                  className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold text-white shrink-0"
+                  style={{
+                    backgroundColor: localUser.color,
+                    outline: `2px solid ${localUser.color}`,
+                    outlineOffset: "2px",
+                  }}
+                >
+                  {localUser.name[0].toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-gray-800 truncate">
+                    {localUser.name}{" "}
+                    <span className="text-gray-400 font-normal">(you)</span>
+                  </p>
+                  <p className="text-[10px] text-green-500">● Active now</p>
+                </div>
+              </div>
+
               {remoteCursors.length === 0 ? (
                 <p className="text-xs text-gray-400">No other users online.</p>
               ) : (
@@ -138,14 +222,13 @@ export default function BoardPage({ params }: BoardPageProps) {
                         <p className="text-xs font-medium text-gray-800 truncate">
                           {c.name}
                         </p>
-                        <p className="text-[10px] text-green-500">
-                          ● Active now
-                        </p>
+                        <p className="text-[10px] text-green-500">● Active now</p>
                       </div>
                     </div>
                   ))}
                 </div>
               )}
+
               <div className="mt-3 pt-3 border-t border-gray-100">
                 <p className="text-[10px] text-gray-400">
                   {remoteCursors.length + 1} collaborator
@@ -157,7 +240,7 @@ export default function BoardPage({ params }: BoardPageProps) {
         </AnimatePresence>
       </div>
 
-      {/* Floating Action Bar (shown when element is selected) */}
+      {/* Floating Action Bar */}
       <FloatingActionBar />
 
       {/* Export Modal */}

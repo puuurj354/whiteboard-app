@@ -51,11 +51,7 @@ interface BoardState {
   clearCanvas: () => void;
 }
 
-const mockCursors: CursorState[] = [
-  { id: "c1", name: "Alice", color: "#3B82F6", x: 320, y: 280 },
-  { id: "c2", name: "Bob", color: "#10B981", x: 580, y: 420 },
-  { id: "c3", name: "Charlie", color: "#EF4444", x: 180, y: 500 },
-];
+// Remote cursors start empty — populated by Supabase Presence in useBoard hook
 
 const initialElements: BoardElement[] = [];
 
@@ -71,7 +67,7 @@ export const useBoardStore = create<BoardState>()(
     historyIndex: 0,
     selectedElementId: null,
     editingTextId: null,
-    remoteCursors: mockCursors,
+    remoteCursors: [],
     viewport: { zoom: 1, pan: { x: 0, y: 0 } },
     showExport: false,
 
