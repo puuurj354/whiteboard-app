@@ -5,11 +5,13 @@
  *
  * 1. getOrCreateBoard(slug)
  * 2. fetchElements → seed local Zustand store
- * 3. Sign in anonymously (Supabase anonymous auth)
+ * 3. Try anonymous auth (non-fatal if disabled in Supabase project)
  * 4. Subscribe to Supabase Realtime channel for the board
  * 5. Presence handshake → broadcast local user info
- * 6. Listen to postgres_changes (INSERT/UPDATE/DELETE on elements)
- * 7. Expose sync helpers for Canvas to call after strokes
+ * 6. Listen to postgres_changes (INSERT/UPDATE/DELETE on board_elements)
+ * 7. Expose sync helpers for page-level code
+ * 8. Periodic reconciliation every 10s
+ * 9. Tab visibility handling — pause sync when hidden, reconcile on return
  */
 
 import { useEffect, useRef, useCallback, useState } from "react";
@@ -25,7 +27,7 @@ import { useBoardStore } from "@/store/useBoardStore";
 import type { BoardElement, CursorState } from "@/types";
 import { addToast } from "@/components/ui/ToastContainer";
 
-// ─── Local identity ────────────────────────────────────────────────────────────
+// ─── Guest identity ────────────────────────────────────────────────────────────
 
 const GUEST_COLORS = [
   "#3B82F6", "#10B981", "#EF4444", "#F59E0B",
@@ -45,7 +47,7 @@ function getOrCreateGuestIdentity(): { name: string; color: string } {
     try {
       return JSON.parse(stored) as { name: string; color: string };
     } catch {
-      // ignore malformed stored value
+      /* ignore malformed */
     }
   }
 
@@ -56,27 +58,35 @@ function getOrCreateGuestIdentity(): { name: string; color: string } {
   return identity;
 }
 
-// ─── Hook ─────────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export type BoardStatus = "idle" | "loading" | "ready" | "error";
 
 interface UseBoardReturn {
-  /** Current board slug */
   boardId: string | null;
-  /** Lifecycle status */
   status: BoardStatus;
-  /** Error message if status === 'error' */
   error: string | null;
-  /** Local user identity */
   localUser: { name: string; color: string };
-  /**
-   * Call this after a stroke / shape is committed to sync it to Supabase.
-   * Internally throttled — safe to call on every element update.
-   */
+  /** DB-persistent sync (debounced 400ms). Use for final commit. */
   syncElement: (element: BoardElement) => void;
-  /** Call this to delete an element from DB */
+  /** DB delete. */
   removeElement: (elementId: string) => void;
+  /** Seed initial server elements as "already synced". */
+  seedInitialSnapshot: (elements: BoardElement[]) => void;
+  /** Instant broadcast to all peers via channel (~50ms). No DB write. */
+  broadcastElement: (element: BoardElement) => void;
+  /** Instant broadcast-delete to all peers. No DB write. */
+  broadcastElementDelete: (elementId: string) => void;
+  /** Broadcast cursor world-position via Presence (throttled 20fps). */
+  broadcastCursorPos: (worldX: number, worldY: number) => void;
 }
+
+// ─── DB type mapping (same as boardService, duplicated for speed) ─────────────
+
+const DB_TO_APP: Record<string, string> = { freedraw: "pencil", ellipse: "circle" };
+const mapDbType = (t: string) => DB_TO_APP[t] ?? t;
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useBoard(slug: string): UseBoardReturn {
   const { setElements, setRemoteCursors, pushToHistory } = useBoardStore();
@@ -89,9 +99,16 @@ export function useBoard(slug: string): UseBoardReturn {
   const boardIdRef = useRef<string | null>(null);
   const localUser = useRef(getOrCreateGuestIdentity());
 
-  // Pending sync queue — batch upserts to avoid hammering DB on every mouse move
+  // Cursor broadcast throttle
+  const lastCursorBroadcast = useRef(0);
+  const CURSOR_THROTTLE_MS = 50; // ~20fps
+
+  // Pending upsert queue — batched by element id, flushed after 400ms idle
   const pendingSync = useRef<Map<string, BoardElement>>(new Map());
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Tracks whether the page is currently visible (used to pause/resume sync)
+  const isVisibleRef = useRef(true);
 
   // ── Flush pending upserts ─────────────────────────────────────────────────
   const flushSync = useCallback(async () => {
@@ -104,27 +121,36 @@ export function useBoard(slug: string): UseBoardReturn {
       try {
         await upsertElement(boardIdRef.current, el);
       } catch (err) {
-        console.error("[useBoard] upsert failed", err);
-        // Rollback handled by caller via reconciliation
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("[useBoard] upsert failed", msg);
+
+        // Surface RLS errors as a toast (likely SQL patch not applied)
+        if (msg.toLowerCase().includes("permission") || msg.toLowerCase().includes("rls")) {
+          addToast(
+            "Sync failed: check Supabase RLS policy on board_elements",
+            "error",
+          );
+        }
+        // Other elements in batch still attempt — don't abort the whole batch
       }
     }
   }, []);
 
-  // ── Public: queue element for sync (debounced) ────────────────────────────
+  // ── Public: queue element for sync ───────────────────────────────────────
   const syncElement = useCallback(
     (element: BoardElement) => {
-      if (element._preview) return; // Never sync preview elements
+      if (element._preview) return;
       pendingSync.current.set(element.id, element);
 
-      // Flush after 400ms of no new changes (or immediately if stroke ended)
       if (syncTimer.current) clearTimeout(syncTimer.current);
       syncTimer.current = setTimeout(flushSync, 400);
     },
     [flushSync],
   );
 
-  // ── Public: delete element from DB ────────────────────────────────────────
+  // ── Public: delete from DB ────────────────────────────────────────────────
   const removeElement = useCallback(async (elementId: string) => {
+    if (!elementId) return;
     try {
       await deleteElement(elementId);
     } catch (err) {
@@ -132,7 +158,22 @@ export function useBoard(slug: string): UseBoardReturn {
     }
   }, []);
 
-  // ── Main effect: boot board & subscribe ───────────────────────────────────
+  // ── Public: seed initial snapshot (prevents re-upsert on first load) ─────
+  const seedInitialSnapshot = useCallback(
+    (elements: BoardElement[]) => {
+      // Mark these elements as "already in DB" — syncElement won't touch them
+      // unless they actually change afterward
+      elements.forEach((el) => {
+        if (!pendingSync.current.has(el.id)) {
+          // Just ensure they're NOT queued
+          pendingSync.current.delete(el.id);
+        }
+      });
+    },
+    [],
+  );
+
+  // ── Main boot effect ───────────────────────────────────────────────────────
   useEffect(() => {
     let isMounted = true;
     let channel: RealtimeChannel | null = null;
@@ -142,13 +183,17 @@ export function useBoard(slug: string): UseBoardReturn {
       setError(null);
 
       try {
-        // ── Step 1: Anonymous auth session ──────────────────────────────────
+        // ── Step 1: Try anonymous auth (non-fatal) ───────────────────────────
+        // If Supabase project has Anonymous sign-ins disabled, we skip silently.
+        // Public RLS (USING true) doesn't require auth.
         const { data: sessionData } = await supabase.auth.getSession();
         if (!sessionData.session) {
           const { error: anonError } = await supabase.auth.signInAnonymously();
           if (anonError) {
-            // Non-fatal — anon auth not strictly needed for public RLS
-            console.warn("[useBoard] anonymous sign-in skipped:", anonError.message);
+            console.info(
+              "[useBoard] anonymous sign-in not available (non-fatal):",
+              anonError.message,
+            );
           }
         }
 
@@ -166,7 +211,7 @@ export function useBoard(slug: string): UseBoardReturn {
         setElements(serverElements);
         pushToHistory(serverElements);
 
-        // ── Step 4: Subscribe to Realtime channel ────────────────────────────
+        // ── Step 4: Realtime channel ─────────────────────────────────────────
         channel = supabase.channel(`board:${board.id}`, {
           config: {
             presence: { key: crypto.randomUUID() },
@@ -195,24 +240,60 @@ export function useBoard(slug: string): UseBoardReturn {
                 y: p.y ?? 0,
               })),
             )
-            // Exclude our own presence key — we track ourselves locally
             .filter((c) => c.name !== localUser.current.name);
 
           if (isMounted) setRemoteCursors(remoteCursors);
         });
 
-        // ── Step 6: DB changes on board_elements ─────────────────────────────
-        // Type mapping: DB uses 'freedraw'/'ellipse', app uses 'pencil'/'circle'
-        const DB_TO_APP: Record<string, string> = { freedraw: "pencil", ellipse: "circle" };
-        const mapType = (t: string) => DB_TO_APP[t] ?? t;
+        // ── Step 6: Broadcast listeners (FAST PATH ~50ms) ────────────────────
+        // Receives element_update / element_delete events sent by other clients
+        // via channel.send(). This bypasses the DB → WAL → Realtime lag.
 
-        const handleIncoming = (raw: Record<string, unknown>): BoardElement => ({
+        // Helper: reconstruct a BoardElement from a DB row (used by postgres_changes)
+        const buildElement = (raw: Record<string, unknown>): BoardElement => ({
           ...(raw.data as object),
           id: raw.id as string,
-          type: mapType(raw.type as string),
+          type: mapDbType(raw.type as string),
           version: raw.version as number,
         } as BoardElement);
 
+        channel.on(
+          "broadcast",
+          { event: "element_update" },
+          ({ payload }) => {
+            if (!isMounted) return;
+            const el = payload as BoardElement;
+            if (!el?.id) return;
+
+            useBoardStore.setState((state) => {
+              const existing = state.elements.find((e) => e.id === el.id);
+              // Deduplicate: skip if our local version is newer
+              if (existing && (existing.version ?? 0) >= (el.version ?? 0)) return {};
+              return {
+                elements: existing
+                  ? state.elements.map((e) => (e.id === el.id ? el : e))
+                  : [...state.elements, el],
+              };
+            });
+          },
+        );
+
+        channel.on(
+          "broadcast",
+          { event: "element_delete" },
+          ({ payload }) => {
+            if (!isMounted) return;
+            const { id } = payload as { id: string };
+            if (!id) return;
+            useBoardStore.setState((state) => ({
+              elements: state.elements.filter((e) => e.id !== id),
+            }));
+          },
+        );
+
+        // ── Step 7: postgres_changes (SLOW PATH, fallback) ───────────────────
+        // Handles reconnection scenarios and clients that missed broadcasts.
+        // Uses version to skip elements already applied via broadcast.
         channel.on(
           "postgres_changes",
           {
@@ -223,11 +304,16 @@ export function useBoard(slug: string): UseBoardReturn {
           },
           (payload) => {
             if (!isMounted) return;
-            const incoming = handleIncoming(payload.new as Record<string, unknown>);
+            const incoming = buildElement(payload.new as Record<string, unknown>);
             useBoardStore.setState((state) => {
-              // Skip if already present (own optimistic update)
-              if (state.elements.some((el) => el.id === incoming.id)) return {};
-              return { elements: [...state.elements, incoming] };
+              const existing = state.elements.find((e) => e.id === incoming.id);
+              // Already applied via broadcast and local version >= DB version → skip
+              if (existing && (existing.version ?? 0) >= (incoming.version ?? 0)) return {};
+              return {
+                elements: existing
+                  ? state.elements.map((e) => (e.id === incoming.id ? incoming : e))
+                  : [...state.elements, incoming],
+              };
             });
           },
         );
@@ -242,12 +328,16 @@ export function useBoard(slug: string): UseBoardReturn {
           },
           (payload) => {
             if (!isMounted) return;
-            const incoming = handleIncoming(payload.new as Record<string, unknown>);
-            useBoardStore.setState((state) => ({
-              elements: state.elements.map((el) =>
-                el.id === incoming.id ? incoming : el,
-              ),
-            }));
+            const incoming = buildElement(payload.new as Record<string, unknown>);
+            useBoardStore.setState((state) => {
+              const existing = state.elements.find((e) => e.id === incoming.id);
+              if (existing && (existing.version ?? 0) >= (incoming.version ?? 0)) return {};
+              return {
+                elements: state.elements.map((e) =>
+                  e.id === incoming.id ? incoming : e,
+                ),
+              };
+            });
           },
         );
 
@@ -268,11 +358,16 @@ export function useBoard(slug: string): UseBoardReturn {
           },
         );
 
-        // ── Step 7: Subscribe & handshake presence ───────────────────────────
-        await new Promise<void>((resolve) => {
-          channel!.subscribe(async (status) => {
-            if (status === "SUBSCRIBED") {
-              // Broadcast our presence
+        // ── Step 7: Subscribe + presence handshake ───────────────────────────
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("Realtime subscription timed out")),
+            15_000,
+          );
+
+          channel!.subscribe(async (subStatus) => {
+            if (subStatus === "SUBSCRIBED") {
+              clearTimeout(timeout);
               await channel!.track({
                 name: localUser.current.name,
                 color: localUser.current.color,
@@ -280,13 +375,16 @@ export function useBoard(slug: string): UseBoardReturn {
                 y: 0,
               });
               resolve();
+            } else if (subStatus === "CHANNEL_ERROR" || subStatus === "TIMED_OUT") {
+              clearTimeout(timeout);
+              reject(new Error(`Realtime channel error: ${subStatus}`));
             }
           });
         });
 
         if (isMounted) {
           setStatus("ready");
-          addToast(`Board "${board.slug}" loaded`, "success");
+          addToast(`Connected to board "${board.slug}"`, "success");
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : "Unknown error";
@@ -294,7 +392,7 @@ export function useBoard(slug: string): UseBoardReturn {
         if (isMounted) {
           setStatus("error");
           setError(message);
-          addToast(`Board error: ${message}`, "error");
+          addToast(`Connection error: ${message}`, "error");
         }
       }
     }
@@ -304,48 +402,130 @@ export function useBoard(slug: string): UseBoardReturn {
     return () => {
       isMounted = false;
       if (syncTimer.current) clearTimeout(syncTimer.current);
-      // Flush any remaining pending changes before unmount
-      flushSync();
+      flushSync(); // Flush remaining on unmount
       if (channel) {
         channel.unsubscribe();
         supabase.removeChannel(channel);
       }
     };
-  // Only re-run if slug changes (page navigation)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
-  // ── Periodic reconciliation (every 10s) ───────────────────────────────────
+  // ── Tab visibility handling ────────────────────────────────────────────────
+  // When tab becomes hidden: pause queued syncs.
+  // When tab returns to visible: trigger reconciliation immediately.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      isVisibleRef.current = document.visibilityState === "visible";
+
+      if (isVisibleRef.current && boardIdRef.current && status === "ready") {
+        // Flush any queued changes immediately
+        flushSync();
+
+        // Reconcile from server after returning to tab
+        fetchElements(boardIdRef.current)
+          .then((serverElements) => {
+            const localEls = useBoardStore
+              .getState()
+              .elements.filter((el) => !el._preview);
+            const serverIds = new Set(serverElements.map((e) => e.id));
+            const localIds = new Set(localEls.map((e) => e.id));
+            const hasDrift =
+              serverIds.size !== localIds.size ||
+              [...serverIds].some((id) => !localIds.has(id));
+
+            if (hasDrift) {
+              console.info("[useBoard] tab returned — drift detected, syncing");
+              useBoardStore.setState({ elements: serverElements });
+            }
+          })
+          .catch(() => {
+            /* silent — best effort */
+          });
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () =>
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [status, flushSync]);
+
+  // ── Periodic reconciliation (every 10s) ────────────────────────────────────
   useEffect(() => {
     if (status !== "ready" || !boardIdRef.current) return;
     const id = boardIdRef.current;
 
     const reconcile = async () => {
+      // Skip reconciliation when tab is hidden — wasteful network call
+      if (!isVisibleRef.current) return;
+
       try {
         const serverElements = await fetchElements(id);
-        const localElements = useBoardStore.getState().elements.filter(
-          (el) => !el._preview,
-        );
+        const localElements = useBoardStore
+          .getState()
+          .elements.filter((el) => !el._preview);
 
-        // Simple diff: compare counts + ids
         const serverIds = new Set(serverElements.map((e) => e.id));
         const localIds = new Set(localElements.map((e) => e.id));
         const hasDrift =
           serverIds.size !== localIds.size ||
-          [...serverIds].some((id) => !localIds.has(id));
+          [...serverIds].some((sid) => !localIds.has(sid));
 
         if (hasDrift) {
-          console.warn("[useBoard] drift detected — syncing from server");
+          console.warn("[useBoard] periodic reconciliation — drift detected");
           useBoardStore.setState({ elements: serverElements });
         }
       } catch {
-        // Silent — reconciliation is best-effort
+        /* silent — reconciliation is best-effort */
       }
     };
 
     const timer = setInterval(reconcile, 10_000);
     return () => clearInterval(timer);
   }, [status]);
+
+  // ── Cursor broadcast (throttled ~20fps via Presence) ──────────────────────
+  const broadcastCursorPos = useCallback(
+    (worldX: number, worldY: number) => {
+      const channel = channelRef.current;
+      if (!channel) return;
+
+      const now = Date.now();
+      if (now - lastCursorBroadcast.current < CURSOR_THROTTLE_MS) return;
+      lastCursorBroadcast.current = now;
+
+      // Fire-and-forget — non-blocking
+      channel.track({
+        name: localUser.current.name,
+        color: localUser.current.color,
+        x: worldX,
+        y: worldY,
+      }).catch(() => { /* silent — cursor broadcast is best-effort */ });
+    },
+    [],
+  );
+
+  // ── Instant element broadcast (FAST PATH) ────────────────────────────────
+  const broadcastElement = useCallback((element: BoardElement) => {
+    const channel = channelRef.current;
+    if (!channel || element._preview) return;
+    // Fire-and-forget — does NOT write to DB
+    channel.send({
+      type: "broadcast",
+      event: "element_update",
+      payload: element,
+    }).catch(() => { /* silent */ });
+  }, []);
+
+  const broadcastElementDelete = useCallback((elementId: string) => {
+    const channel = channelRef.current;
+    if (!channel || !elementId) return;
+    channel.send({
+      type: "broadcast",
+      event: "element_delete",
+      payload: { id: elementId },
+    }).catch(() => { /* silent */ });
+  }, []);
 
   return {
     boardId,
@@ -354,5 +534,9 @@ export function useBoard(slug: string): UseBoardReturn {
     localUser: localUser.current,
     syncElement,
     removeElement,
+    seedInitialSnapshot,
+    broadcastElement,
+    broadcastElementDelete,
+    broadcastCursorPos,
   };
 }

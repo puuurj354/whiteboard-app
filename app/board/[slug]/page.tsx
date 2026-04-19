@@ -39,14 +39,36 @@ export default function BoardPage({ params }: BoardPageProps) {
   } = useBoardStore();
 
   // ── Supabase integration ───────────────────────────────────────────────────
-  const { status, error, localUser, syncElement, removeElement } = useBoard(slug);
+  const {
+    status, error, localUser,
+    syncElement, removeElement, seedInitialSnapshot,
+    broadcastElement, broadcastElementDelete,
+    broadcastCursorPos,
+  } = useBoard(slug);
 
-  // ── Forward sync calls from store mutations ────────────────────────────────
-  // Diff previous vs current to only sync elements that actually changed.
-  const prevElementsRef = useRef<Map<string, string>>(new Map()); // id → JSON snapshot
+  // ── Diff-based element sync ────────────────────────────────────────────────
+  // id → JSON snapshot of last known state. Avoids re-upserting unchanged elements.
+  const prevElementsRef = useRef<Map<string, string>>(new Map());
+  const seededRef = useRef(false); // prevent double-seeding
 
+  // Step A: When board first becomes ready, seed the snapshot from server data.
+  // This ensures elements fetched from DB are NOT immediately re-upserted.
   useEffect(() => {
-    if (status !== "ready") return;
+    if (status !== "ready" || seededRef.current) return;
+    seededRef.current = true;
+
+    const serverElements = elements.filter((el) => !el._preview);
+    serverElements.forEach((el) => {
+      prevElementsRef.current.set(el.id, JSON.stringify(el));
+    });
+    seedInitialSnapshot(serverElements);
+  // Only run once when status becomes ready
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
+
+  // Step B: After seed, diff and sync user-driven changes.
+  useEffect(() => {
+    if (status !== "ready" || !seededRef.current) return;
 
     const current = elements.filter((el) => !el._preview);
     const currentIds = new Set(current.map((el) => el.id));
@@ -55,7 +77,8 @@ export default function BoardPage({ params }: BoardPageProps) {
     // Detect deleted elements
     for (const prevId of prev.keys()) {
       if (!currentIds.has(prevId)) {
-        removeElement(prevId);
+        broadcastElementDelete(prevId); // ← instant to peers (~50ms)
+        removeElement(prevId);          // ← DB delete (async)
         prev.delete(prevId);
       }
     }
@@ -64,13 +87,14 @@ export default function BoardPage({ params }: BoardPageProps) {
     for (const el of current) {
       const snapshot = JSON.stringify(el);
       if (prev.get(el.id) !== snapshot) {
-        syncElement(el);
+        broadcastElement(el); // ← instant to peers (~50ms)
+        syncElement(el);      // ← DB upsert (debounced 400ms)
         prev.set(el.id, snapshot);
       }
     }
-
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [elements, status]);
+  }, [elements]);
+
 
 
   // ── Loading / Error screen ─────────────────────────────────────────────────
@@ -148,7 +172,7 @@ export default function BoardPage({ params }: BoardPageProps) {
 
         {/* Canvas Area */}
         <div className="flex-1 relative overflow-hidden">
-          <Canvas />
+          <Canvas broadcastCursorPos={broadcastCursorPos} />
 
           {/* Text Editing Overlay */}
           {editingTextId && <TextEditor key={editingTextId} />}

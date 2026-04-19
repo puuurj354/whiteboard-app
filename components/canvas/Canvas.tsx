@@ -39,7 +39,14 @@ function drawSmoothPath(
   ctx.stroke();
 }
 
-export function Canvas() {
+// ─── Props ────────────────────────────────────────────────────────────────────
+
+interface CanvasProps {
+  /** Called with world-space coordinates on every pointer move (for presence). */
+  broadcastCursorPos?: (worldX: number, worldY: number) => void;
+}
+
+export function Canvas({ broadcastCursorPos }: CanvasProps) {
   // ── Refs ──────────────────────────────────────────────────────────────────
   /** Bottom layer: committed, finalised elements */
   const staticCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -668,7 +675,17 @@ export function Canvas() {
           // Delegate to mouse handler (React synthetic events are compatible)
           onMouseDown(e as unknown as React.MouseEvent);
         }}
-        onPointerMove={(e) => onMouseMove(e as unknown as React.MouseEvent)}
+        onPointerMove={(e) => {
+          onMouseMove(e as unknown as React.MouseEvent);
+          // Broadcast cursor position for remote presence
+          if (broadcastCursorPos && containerRef.current) {
+            const rect = containerRef.current.getBoundingClientRect();
+            const { pan, zoom } = viewport;
+            const worldX = (e.clientX - rect.left - pan.x) / zoom;
+            const worldY = (e.clientY - rect.top - pan.y) / zoom;
+            broadcastCursorPos(worldX, worldY);
+          }
+        }}
         onPointerUp={(e) => {
           (e.target as HTMLCanvasElement).releasePointerCapture(e.pointerId);
           onMouseUp(e as unknown as React.MouseEvent);
