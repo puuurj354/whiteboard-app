@@ -14,18 +14,21 @@ interface BoardState {
   tool: string;
   color: string;
   strokeWidth: number;
+  showGrid: boolean;
   history: BoardElement[][];
   historyIndex: number;
   selectedElementId: string | null;
   editingTextId: string | null;
   remoteCursors: CursorState[];
   viewport: Viewport;
+  showExport: boolean;
 
   // --- Actions ---
   setElements: (elements: BoardElement[], skipHistory?: boolean) => void;
   setTool: (tool: string) => void;
   setColor: (color: string) => void;
   setStrokeWidth: (width: number) => void;
+  setShowGrid: (show: boolean) => void;
 
   pushToHistory: (currentElements: BoardElement[]) => void;
   undo: () => void;
@@ -40,7 +43,19 @@ interface BoardState {
   // Presence actions
   setRemoteCursors: (cursors: CursorState[]) => void;
   updateRemoteCursor: (id: string, x: number, y: number) => void;
+
+  // Export actions
+  setShowExport: (show: boolean) => void;
+
+  // Canvas actions
+  clearCanvas: () => void;
 }
+
+const mockCursors: CursorState[] = [
+  { id: "c1", name: "Alice", color: "#3B82F6", x: 320, y: 280 },
+  { id: "c2", name: "Bob", color: "#10B981", x: 580, y: 420 },
+  { id: "c3", name: "Charlie", color: "#EF4444", x: 180, y: 500 },
+];
 
 const initialElements: BoardElement[] = [];
 
@@ -51,12 +66,14 @@ export const useBoardStore = create<BoardState>()(
     tool: "select",
     color: "#000000",
     strokeWidth: 3,
+    showGrid: true,
     history: [initialElements],
     historyIndex: 0,
     selectedElementId: null,
     editingTextId: null,
-    remoteCursors: [],
+    remoteCursors: mockCursors,
     viewport: { zoom: 1, pan: { x: 0, y: 0 } },
+    showExport: false,
 
     // Actions
     setElements: (elements, skipHistory = false) =>
@@ -69,6 +86,7 @@ export const useBoardStore = create<BoardState>()(
     setTool: (tool) => set({ tool }),
     setColor: (color) => set({ color }),
     setStrokeWidth: (strokeWidth) => set({ strokeWidth }),
+    setShowGrid: (showGrid) => set({ showGrid }),
 
     pushToHistory: (currentElements) => {
       const { history, historyIndex } = get();
@@ -125,5 +143,12 @@ export const useBoardStore = create<BoardState>()(
           c.id === id ? { ...c, x, y } : c,
         ),
       })),
+
+    setShowExport: (show) => set({ showExport: show }),
+
+    clearCanvas: () => {
+      get().pushToHistory([]);
+      set({ elements: [], selectedElementId: null });
+    },
   })),
 );

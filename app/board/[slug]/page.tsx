@@ -1,6 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { use } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { PanelLeftOpen } from "lucide-react";
 import { useBoardStore } from "@/store/useBoardStore";
 import { TopBar } from "@/components/toolbar/TopBar";
 import { ToolSidebar } from "@/components/toolbar/ToolSidebar";
@@ -14,22 +17,40 @@ import { TextEditor } from "@/components/elements/TextEditor";
 import { FloatingActionBar } from "@/components/toolbar/FloatingActionBar";
 
 interface BoardPageProps {
-  params: {
-    slug: string;
-  };
+  params: Promise<{ slug: string }>;
 }
 
 export default function BoardPage({ params }: BoardPageProps) {
-  const { slug } = params;
+  const { slug } = use(params);
 
-  // UI State (tidak perlu di zustand karena hanya untuk UI toggle)
+  // UI-only state (no need to live in Zustand)
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [showExport, setShowExport] = useState(false);
-  const [showColorPicker, setShowColorPicker] = useState(false);
+  const [showPresencePanel, setShowPresencePanel] = useState(false);
 
-  // Get state from Zustand
-  const { selectedElementId, editingTextId, remoteCursors, elements } =
-    useBoardStore();
+  const {
+    selectedElementId,
+    editingTextId,
+    remoteCursors,
+    elements,
+    showExport,
+    setShowExport,
+    tool,
+    updateRemoteCursor,
+  } = useBoardStore();
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Simulate random cursor movement for demo
+      ["c1", "c2", "c3"].forEach((id) => {
+        updateRemoteCursor(
+          id,
+          Math.random() * 800 + 100,
+          Math.random() * 500 + 100,
+        );
+      });
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [updateRemoteCursor]);
 
   return (
     <div
@@ -39,24 +60,28 @@ export default function BoardPage({ params }: BoardPageProps) {
       {/* Top Bar */}
       <TopBar
         slug={slug}
-        sidebarOpen={sidebarOpen}
-        setSidebarOpen={setSidebarOpen}
         setShowExport={setShowExport}
-        showColorPicker={showColorPicker}
-        setShowColorPicker={setShowColorPicker}
+        showPresencePanel={showPresencePanel}
+        setShowPresencePanel={setShowPresencePanel}
       />
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden relative">
         {/* Left Toolbar */}
-        <ToolSidebar
-          isOpen={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
-        />
+        <AnimatePresence>
+          {sidebarOpen && (
+            <ToolSidebar
+              isOpen={sidebarOpen}
+              onClose={() => setSidebarOpen(false)}
+            />
+          )}
+        </AnimatePresence>
 
+        {/* Collapsed Sidebar Toggle */}
         {!sidebarOpen && (
           <button
             onClick={() => setSidebarOpen(true)}
-            className="absolute top-16 left-3 z-30 bg-white border border-gray-200 rounded-lg p-2 text-gray-500 hover:text-gray-800 hover:bg-gray-50 shadow-sm transition-all"
+            className="absolute top-3 left-3 z-30 bg-white border border-gray-200 rounded-lg p-2 text-gray-500 hover:text-gray-800 hover:bg-gray-50 shadow-sm transition-all"
+            title="Open Sidebar"
           >
             <PanelLeftOpen size={16} />
           </button>
@@ -67,10 +92,10 @@ export default function BoardPage({ params }: BoardPageProps) {
           <Canvas />
 
           {/* Text Editing Overlay */}
-          {editingTextId && <TextEditor />}
+          {editingTextId && <TextEditor key={editingTextId} />}
 
           {/* Selection Box */}
-          {selectedElementId && <SelectionBox />}
+          {selectedElementId && tool === "select" && <SelectionBox />}
 
           {/* Remote Cursors */}
           <RemoteCursors cursors={remoteCursors} />
@@ -78,18 +103,67 @@ export default function BoardPage({ params }: BoardPageProps) {
           {/* Zoom Controls */}
           <ZoomControls />
 
-          {/* Element Count */}
-          <div className="absolute bottom-4 right-4 bg-white/80 backdrop-blur rounded-lg px-3 py-1.5 text-[11px] text-gray-500 z-20">
-            {elements.length} element{elements.length !== 1 ? "s" : ""}
+          {/* Element Counter */}
+          <div className="absolute bottom-4 right-4 bg-white/80 backdrop-blur rounded-lg px-3 py-1.5 text-[11px] text-gray-500 z-20 border border-gray-200/50">
+            {elements.filter((el) => !el._preview).length} element
+            {elements.filter((el) => !el._preview).length !== 1 ? "s" : ""}
           </div>
         </div>
+
+        {/* Presence Panel */}
+        <AnimatePresence>
+          {showPresencePanel && (
+            <motion.div
+              initial={{ opacity: 0, x: 10 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 10 }}
+              className="absolute top-2 right-4 bg-white rounded-xl shadow-xl border border-gray-200 p-4 z-30 w-64"
+            >
+              <h3 className="text-sm font-bold text-gray-800 mb-3">
+                Active Users
+              </h3>
+              {remoteCursors.length === 0 ? (
+                <p className="text-xs text-gray-400">No other users online.</p>
+              ) : (
+                <div className="space-y-2">
+                  {remoteCursors.map((c) => (
+                    <div key={c.id} className="flex items-center gap-2">
+                      <div
+                        className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold text-white shrink-0"
+                        style={{ backgroundColor: c.color }}
+                      >
+                        {c.name[0].toUpperCase()}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium text-gray-800 truncate">
+                          {c.name}
+                        </p>
+                        <p className="text-[10px] text-green-500">
+                          ● Active now
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="mt-3 pt-3 border-t border-gray-100">
+                <p className="text-[10px] text-gray-400">
+                  {remoteCursors.length + 1} collaborator
+                  {remoteCursors.length + 1 !== 1 ? "s" : ""} viewing
+                </p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
-      {/* Floating Action Bar (when element selected) */}
-      {selectedElementId && <FloatingActionBar />}
+      {/* Floating Action Bar (shown when element is selected) */}
+      <FloatingActionBar />
 
       {/* Export Modal */}
-      {showExport && <ExportModal onClose={() => setShowExport(false)} />}
+      <AnimatePresence>
+        {showExport && <ExportModal onClose={() => setShowExport(false)} />}
+      </AnimatePresence>
 
       {/* Toast Notifications */}
       <ToastContainer />

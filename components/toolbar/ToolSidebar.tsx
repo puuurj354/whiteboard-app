@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { PanelLeftClose, ChevronDown } from "lucide-react";
+import { PanelLeftClose } from "lucide-react";
 import { useBoardStore } from "@/store/useBoardStore";
 import { TOOLS, COLORS, STROKE_SIZES } from "@/lib/constants";
 

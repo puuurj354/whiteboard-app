@@ -3,6 +3,7 @@
 import { useRef, useEffect, useCallback } from "react";
 import { useBoardStore } from "@/store/useBoardStore";
 import type { Point } from "@/types";
+import { addToast } from "@/components/ui/ToastContainer";
 
 export function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -14,16 +15,20 @@ export function Canvas() {
     tool,
     color,
     strokeWidth,
+    showGrid,
     setElements,
     pushToHistory,
     selectedElementId,
     setSelectedElement,
     viewport,
     setViewport,
-    setTool, // Action to change tool
-    undo, // Action for undo
-    redo, // Action for redo
-    editingTextId, // Check if editing text
+    setTool,
+    undo,
+    redo,
+    editingTextId,
+    setEditingTextId,
+    setShowGrid,
+    setShowExport,
   } = useBoardStore();
 
   // Local state for drawing
@@ -47,6 +52,13 @@ export function Canvas() {
         } else {
           undo();
         }
+        return;
+      }
+
+      // Ctrl/Cmd + S (Export)
+      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+        e.preventDefault();
+        setShowExport(true);
         return;
       }
 
@@ -76,6 +88,12 @@ export function Canvas() {
         case "e":
           setTool("eraser");
           break;
+        case "g":
+          setShowGrid(!showGrid);
+          break;
+        case "escape":
+          setSelectedElement(null);
+          break;
         case "delete":
         case "backspace":
           if (selectedElementId) {
@@ -84,6 +102,7 @@ export function Canvas() {
             setElements(newEls);
             pushToHistory(newEls);
             setSelectedElement(null);
+            addToast("Element deleted", "info");
           }
           break;
         default:
@@ -103,6 +122,9 @@ export function Canvas() {
     setElements,
     pushToHistory,
     setSelectedElement,
+    showGrid,
+    setShowGrid,
+    setShowExport,
   ]);
   // --------------------------------
 
@@ -371,6 +393,55 @@ export function Canvas() {
     startPos.current = null;
   };
 
+  // Scroll wheel zoom (zooms towards cursor position)
+  const onWheel = useCallback(
+    (e: WheelEvent) => {
+      e.preventDefault();
+
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
+
+      const { zoom, pan } = viewport;
+
+      // Pinch-to-zoom via trackpad sends small deltaY; mouse wheel sends larger values
+      const zoomFactor = e.ctrlKey
+        ? 1 - e.deltaY * 0.01 // pinch gesture (ctrlKey = true on trackpad pinch)
+        : 1 - e.deltaY * 0.001; // scroll wheel
+
+      const newZoom = Math.min(
+        5,
+        Math.max(0.1, parseFloat((zoom * zoomFactor).toFixed(3))),
+      );
+
+      // Zoom towards the cursor position
+      const cursorX = e.clientX - rect.left;
+      const cursorY = e.clientY - rect.top;
+
+      const newPanX = cursorX - (cursorX - pan.x) * (newZoom / zoom);
+      const newPanY = cursorY - (cursorY - pan.y) * (newZoom / zoom);
+
+      setViewport({ zoom: newZoom, pan: { x: newPanX, y: newPanY } });
+    },
+    [viewport, setViewport],
+  );
+
+  // Attach wheel listener as non-passive so preventDefault() works
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, [onWheel]);
+
+  // Double-click to edit text / sticky elements
+  const onDoubleClick = (e: React.MouseEvent) => {
+    const coords = getCanvasCoords(e);
+    const hit = hitTest(coords);
+    if (hit && (hit.type === "text" || hit.type === "sticky")) {
+      setEditingTextId(hit.id);
+    }
+  };
+
   const roundRect = (
     ctx: CanvasRenderingContext2D,
     x: number,
@@ -476,26 +547,28 @@ export function Canvas() {
     ctx.fillStyle = "#FAFAFA";
     ctx.fillRect(0, 0, rect.width, rect.height);
 
-    // Draw grid
-    ctx.strokeStyle = "#E5E7EB";
-    ctx.lineWidth = 0.5;
-    const gridSize = 24;
-    const offsetX =
-      (viewport.pan.x % (gridSize * viewport.zoom)) / viewport.zoom;
-    const offsetY =
-      (viewport.pan.y % (gridSize * viewport.zoom)) / viewport.zoom;
+    // Draw grid (conditional)
+    if (showGrid) {
+      ctx.strokeStyle = "#E5E7EB";
+      ctx.lineWidth = 0.5;
+      const gridSize = 24;
+      const offsetX =
+        (viewport.pan.x % (gridSize * viewport.zoom)) / viewport.zoom;
+      const offsetY =
+        (viewport.pan.y % (gridSize * viewport.zoom)) / viewport.zoom;
 
-    for (let x = offsetX; x < rect.width; x += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, rect.height);
-      ctx.stroke();
-    }
-    for (let y = offsetY; y < rect.height; y += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(rect.width, y);
-      ctx.stroke();
+      for (let x = offsetX; x < rect.width; x += gridSize) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, rect.height);
+        ctx.stroke();
+      }
+      for (let y = offsetY; y < rect.height; y += gridSize) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(rect.width, y);
+        ctx.stroke();
+      }
     }
 
     // Apply transform
@@ -533,7 +606,7 @@ export function Canvas() {
       ctx.stroke();
       ctx.restore();
     }
-  }, [elements, viewport, color, strokeWidth, tool, drawElements]);
+  }, [elements, viewport, color, strokeWidth, tool, showGrid, drawElements]);
 
   return (
     <div
@@ -555,6 +628,7 @@ export function Canvas() {
         onMouseMove={onMouseMove}
         onMouseUp={onMouseUp}
         onMouseLeave={onMouseUp}
+        onDoubleClick={onDoubleClick}
         onContextMenu={(e) => e.preventDefault()}
       />
     </div>

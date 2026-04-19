@@ -1,8 +1,15 @@
 "use client";
 
 import { Canvas } from "@/components/canvas/Canvas";
+import { SelectionBox } from "@/components/elements/SelectionBox";
+import { TextEditor } from "@/components/elements/TextEditor";
+import { FloatingActionBar } from "@/components/toolbar/FloatingActionBar";
+import { ToastContainer } from "@/components/ui/ToastContainer";
+import { useBoardStore } from "@/store/useBoardStore";
 
 export default function TestCanvasPage() {
+  const { selectedElementId, editingTextId } = useBoardStore();
+
   return (
     <div className="h-screen w-screen bg-gray-50 flex flex-col overflow-hidden">
       {/* Simple Header */}
@@ -19,6 +26,10 @@ export default function TestCanvasPage() {
       {/* Canvas Full Screen */}
       <div className="flex-1 relative">
         <Canvas />
+        {editingTextId && <TextEditor key={editingTextId} />}
+        {selectedElementId && <SelectionBox />}
+        <FloatingActionBar />
+        <ToastContainer />
       </div>
     </div>
   );
