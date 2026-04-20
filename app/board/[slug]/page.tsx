@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { use } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { PanelLeftOpen, Wifi, WifiOff, Loader2 } from "lucide-react";
+import { PanelLeftOpen, Wifi, WifiOff, Loader2, Pencil } from "lucide-react";
 import { useBoardStore } from "@/store/useBoardStore";
 import { useBoard } from "@/hooks/useBoard";
 import { TopBar } from "@/components/toolbar/TopBar";
@@ -16,6 +16,7 @@ import { ToastContainer } from "@/components/ui/ToastContainer";
 import { SelectionBox } from "@/components/elements/SelectionBox";
 import { TextEditor } from "@/components/elements/TextEditor";
 import { FloatingActionBar } from "@/components/toolbar/FloatingActionBar";
+import { NamePickerModal } from "@/components/ui/NamePickerModal";
 
 interface BoardPageProps {
   params: Promise<{ slug: string }>;
@@ -27,6 +28,14 @@ export default function BoardPage({ params }: BoardPageProps) {
   // UI-only state
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showPresencePanel, setShowPresencePanel] = useState(false);
+  // Show name picker on first visit (when no stored identity is found)
+  const [showNamePicker, setShowNamePicker] = useState(false);
+  const [namePickerMode, setNamePickerMode] = useState<"join" | "edit">("join");
+
+  useEffect(() => {
+    const hasIdentity = Boolean(localStorage.getItem("wb_guest_identity"));
+    if (!hasIdentity) setShowNamePicker(true);
+  }, []);
 
   const {
     selectedElementId,
@@ -43,8 +52,13 @@ export default function BoardPage({ params }: BoardPageProps) {
     status, error, localUser,
     syncElement, removeElement, seedInitialSnapshot,
     broadcastElement, broadcastElementDelete,
-    broadcastCursorPos,
+    broadcastCursorPos, updateIdentity,
   } = useBoard(slug);
+
+  function handleIdentityConfirm(name: string, color: string) {
+    updateIdentity(name, color);
+    setShowNamePicker(false);
+  }
 
   // ── Diff-based element sync ────────────────────────────────────────────────
   // id → JSON snapshot of last known state. Avoids re-upserting unchanged elements.
@@ -228,6 +242,14 @@ export default function BoardPage({ params }: BoardPageProps) {
                   </p>
                   <p className="text-[10px] text-green-500">● Active now</p>
                 </div>
+                {/* Edit name button */}
+                <button
+                  onClick={() => { setNamePickerMode("edit"); setShowNamePicker(true); }}
+                  className="p-1 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-all"
+                  title="Change display name"
+                >
+                  <Pencil size={11} />
+                </button>
               </div>
 
               {remoteCursors.length === 0 ? (
@@ -274,6 +296,18 @@ export default function BoardPage({ params }: BoardPageProps) {
 
       {/* Toast Notifications */}
       <ToastContainer />
+
+      {/* Name Picker Modal */}
+      <AnimatePresence>
+        {showNamePicker && (
+          <NamePickerModal
+            initial={localUser}
+            mode={namePickerMode}
+            onConfirm={handleIdentityConfirm}
+            onClose={namePickerMode === "edit" ? () => setShowNamePicker(false) : undefined}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

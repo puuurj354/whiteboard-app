@@ -43,4 +43,6 @@ export interface CursorState {
   color: string;
   x: number;
   y: number;
+  /** Unix ms timestamp of last presence update. Used to filter stale entries. */
+  lastActive: number;
 }

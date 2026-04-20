@@ -79,6 +79,8 @@ interface UseBoardReturn {
   broadcastElementDelete: (elementId: string) => void;
   /** Broadcast cursor world-position via Presence (throttled 20fps). */
   broadcastCursorPos: (worldX: number, worldY: number) => void;
+  /** Update local display name/color and immediately re-broadcast presence. */
+  updateIdentity: (name: string, color: string) => void;
 }
 
 // ─── DB type mapping (same as boardService, duplicated for speed) ─────────────
@@ -97,7 +99,25 @@ export function useBoard(slug: string): UseBoardReturn {
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const boardIdRef = useRef<string | null>(null);
-  const localUser = useRef(getOrCreateGuestIdentity());
+
+  // ── Per-tab session key ───────────────────────────────────────────────────
+  // Unique UUID per browser tab — persisted in sessionStorage so it survives
+  // hot-reloads but is DIFFERENT in each tab (unlike localStorage).
+  // This is what we use to filter self out of presence, NOT the display name.
+  // Note: useRef does NOT support lazy init — use an IIFE to compute inline.
+  const sessionKeyRef = useRef<string>((() => {
+    if (typeof window === "undefined") return crypto.randomUUID();
+    const stored = sessionStorage.getItem("wb_session_key");
+    if (stored) return stored;
+    const newKey = crypto.randomUUID();
+    sessionStorage.setItem("wb_session_key", newKey);
+    return newKey;
+  })());
+
+  // ── Local identity (name + color) ────────────────────────────────────────
+  const [localUser, setLocalUser] = useState(() => getOrCreateGuestIdentity());
+  const localUserRef = useRef(localUser); // ref for use inside callbacks
+  useEffect(() => { localUserRef.current = localUser; }, [localUser]);
 
   // Cursor broadcast throttle
   const lastCursorBroadcast = useRef(0);
@@ -212,9 +232,12 @@ export function useBoard(slug: string): UseBoardReturn {
         pushToHistory(serverElements);
 
         // ── Step 4: Realtime channel ─────────────────────────────────────────
+        // Each tab uses its unique sessionKeyRef as the presence key.
+        // This guarantees self-filtering works even when multiple tabs
+        // share the same localStorage identity (same name/color).
         channel = supabase.channel(`board:${board.id}`, {
           config: {
-            presence: { key: crypto.randomUUID() },
+            presence: { key: sessionKeyRef.current },
             broadcast: { self: false },
           },
         });
@@ -222,25 +245,32 @@ export function useBoard(slug: string): UseBoardReturn {
         channelRef.current = channel;
 
         // ── Step 5: Presence ─────────────────────────────────────────────────
+        // Stale threshold: entries not updated in 90s are considered disconnected.
+        const STALE_MS = 90_000;
+
         channel.on("presence", { event: "sync" }, () => {
           const state = channel!.presenceState<{
             name: string;
             color: string;
             x: number;
             y: number;
+            lastActive: number;
           }>();
 
+          const now = Date.now();
           const remoteCursors: CursorState[] = Object.entries(state)
+            .filter(([key]) => key !== sessionKeyRef.current) // filter self by UUID
             .flatMap(([key, presences]) =>
               presences.map((p) => ({
                 id: key,
-                name: p.name,
-                color: p.color,
+                name: p.name ?? "Anonymous",
+                color: p.color ?? "#6366f1",
                 x: p.x ?? 0,
                 y: p.y ?? 0,
+                lastActive: p.lastActive ?? 0,
               })),
             )
-            .filter((c) => c.name !== localUser.current.name);
+            .filter((c) => now - c.lastActive < STALE_MS); // remove stale ghosts
 
           if (isMounted) setRemoteCursors(remoteCursors);
         });
@@ -369,10 +399,11 @@ export function useBoard(slug: string): UseBoardReturn {
             if (subStatus === "SUBSCRIBED") {
               clearTimeout(timeout);
               await channel!.track({
-                name: localUser.current.name,
-                color: localUser.current.color,
+                name: localUserRef.current.name,
+                color: localUserRef.current.color,
                 x: 0,
                 y: 0,
+                lastActive: Date.now(),
               });
               resolve();
             } else if (subStatus === "CHANNEL_ERROR" || subStatus === "TIMED_OUT") {
@@ -404,8 +435,14 @@ export function useBoard(slug: string): UseBoardReturn {
       if (syncTimer.current) clearTimeout(syncTimer.current);
       flushSync(); // Flush remaining on unmount
       if (channel) {
-        channel.unsubscribe();
-        supabase.removeChannel(channel);
+        // Explicitly untrack self from Presence so other clients see us
+        // leave immediately instead of waiting for Supabase's TTL (30-60s).
+        channel.untrack()
+          .catch(() => { /* best-effort */ })
+          .finally(() => {
+            channel!.unsubscribe();
+            supabase.removeChannel(channel!);
+          });
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -496,14 +533,34 @@ export function useBoard(slug: string): UseBoardReturn {
 
       // Fire-and-forget — non-blocking
       channel.track({
-        name: localUser.current.name,
-        color: localUser.current.color,
+        name: localUserRef.current.name,
+        color: localUserRef.current.color,
         x: worldX,
         y: worldY,
+        lastActive: Date.now(), // updated each cursor move — used for stale detection
       }).catch(() => { /* silent — cursor broadcast is best-effort */ });
     },
     [],
   );
+
+  // ── Update identity + re-broadcast presence ──────────────────────────────
+  const updateIdentity = useCallback((name: string, color: string) => {
+    if (!name.trim()) return;
+    const identity = { name: name.trim(), color };
+    // Persist to localStorage so it's remembered next visit
+    try {
+      localStorage.setItem("wb_guest_identity", JSON.stringify(identity));
+    } catch { /* storage unavailable */ }
+    setLocalUser(identity);
+    // Immediately re-broadcast so other clients see the new name/color
+    channelRef.current?.track({
+      name: identity.name,
+      color: identity.color,
+      x: 0,
+      y: 0,
+      lastActive: Date.now(),
+    }).catch(() => { /* silent */ });
+  }, []);
 
   // ── Instant element broadcast (FAST PATH) ────────────────────────────────
   const broadcastElement = useCallback((element: BoardElement) => {
@@ -531,12 +588,13 @@ export function useBoard(slug: string): UseBoardReturn {
     boardId,
     status,
     error,
-    localUser: localUser.current,
+    localUser,
     syncElement,
     removeElement,
     seedInitialSnapshot,
     broadcastElement,
     broadcastElementDelete,
     broadcastCursorPos,
+    updateIdentity,
   };
 }

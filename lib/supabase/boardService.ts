@@ -1,22 +1,14 @@
-/**
- * boardService — Supabase DB interactions adapted to the existing schema.
- *
- * Schema facts:
- *  - Table: public.boards           (id, slug, created_at, updated_at) — NO `name` column
- *  - Table: public.board_elements   (id, board_id, type, data, version, created_at, updated_at)
- *  - Type mapping: app `pencil` ↔ DB `freedraw`, app `circle` ↔ DB `ellipse`
- */
+
 import { supabase } from "@/lib/supabase/client";
 import type { BoardElement } from "@/types";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface BoardRecord {
   id: string;
   slug: string;
 }
 
-// ─── Type mapping (app ↔ DB) ──────────────────────────────────────────────────
+
 
 const APP_TO_DB_TYPE: Record<string, string> = {
   pencil: "freedraw",
